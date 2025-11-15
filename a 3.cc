@@ -5,6 +5,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cctype>
 #include <unordered_map>
 #include <random>
 
@@ -113,15 +114,15 @@ private:
     // History heuristic
     int history[8][8][8][8]; // [from_r][from_c][to_r][to_c]
     
-    bool is_upper(char c) {
+    bool is_upper(char c) const {
         return c >= 'A' && c <= 'Z';
     }
-    
-    bool is_lower(char c) {
+
+    bool is_lower(char c) const {
         return c >= 'a' && c <= 'z';
     }
-    
-    int index_of(char c) {
+
+    int index_of(char c) const {
         char u = toupper(c);
         switch(u) {
             case 'W': return 0;
@@ -132,22 +133,26 @@ private:
             default: return -1;
         }
     }
-    
-    int get_piece_value(char piece) {
+
+    int get_piece_value(char piece) const {
         if (piece == '.') return 0;
         int idx = index_of(piece);
         return idx >= 0 ? PIECE_VALUES[idx] : 0;
     }
-    
-    int piece_to_zobrist_index(char piece) {
+
+    int piece_to_zobrist_index(char piece) const {
         if (piece == '.') return -1;
         int base_idx = index_of(piece);
         if (base_idx < 0) return -1;
         // Upper case (Red) = 0-5, Lower case (Blue) = 6-11
         return is_upper(piece) ? base_idx : base_idx + 6;
     }
-    
-    uint64_t compute_hash() {
+
+    bool in_bounds(int r, int c) const {
+        return r >= 0 && r < 8 && c >= 0 && c < 8;
+    }
+
+    uint64_t compute_position_hash(bool red_to_move) const {
         uint64_t hash = 0;
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
@@ -157,35 +162,12 @@ private:
                 }
             }
         }
-        if (!isRed) hash ^= zobrist_turn;
+        if (red_to_move) hash ^= zobrist_turn;
         return hash;
     }
-    
-    void update_hash_for_move(const Move& move) {
-        if (move.is_revival) {
-            int p_idx = piece_to_zobrist_index(move.piece);
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r2][move.c2][p_idx];
-            }
-        } else {
-            // Remove piece from source
-            int p_idx = piece_to_zobrist_index(board[move.r1][move.c1]);
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r1][move.c1][p_idx];
-            }
-            // Remove captured piece from destination
-            if (move.target != '.') {
-                int t_idx = piece_to_zobrist_index(move.target);
-                if (t_idx >= 0) {
-                    current_hash ^= zobrist[move.r2][move.c2][t_idx];
-                }
-            }
-            // Add piece to destination
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r2][move.c2][p_idx];
-            }
-        }
-        current_hash ^= zobrist_turn; // Toggle turn
+
+    void refresh_hash(bool red_to_move) {
+        current_hash = compute_position_hash(red_to_move);
     }
     
     vector<Move> get_piece_moves(int r, int c, char piece) {
@@ -267,43 +249,63 @@ private:
     }
     
     bool make_move(const Move& move, bool red_turn) {
-        update_hash_for_move(move);
-
         if (move.is_revival) {
+            if (!in_bounds(move.r2, move.c2) || board[move.r2][move.c2] != '.') {
+                return false;
+            }
             board[move.r2][move.c2] = move.piece;
             int idx = index_of(move.piece);
             if (idx >= 0) {
-                if (red_turn) capRed[idx]--;
-                else capBlue[idx]--;
+                int* captured = red_turn ? capRed : capBlue;
+                if (captured[idx] <= 0) {
+                    board[move.r2][move.c2] = '.';
+                    return false;
+                }
+                captured[idx]--;
             }
+            refresh_hash(!red_turn);
             return false;
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return false;
+            }
             char piece = board[move.r1][move.c1];
+            if (piece == '.') {
+                return false;
+            }
+
+            char captured = board[move.r2][move.c2];
             board[move.r2][move.c2] = piece;
             board[move.r1][move.c1] = '.';
 
-            if (move.target != '.') {
-                int idx = index_of(move.target);
+            if (captured != '.') {
+                int idx = index_of(captured);
                 if (idx >= 0) {
                     if (red_turn) capRed[idx]++;
                     else capBlue[idx]++;
                 }
-
-                return toupper(move.target) == 'W';
             }
+
+            refresh_hash(!red_turn);
+            return captured != '.' && toupper(captured) == 'W';
         }
-        return false;
     }
 
     void unmake_move(const Move& move, bool red_turn) {
         if (move.is_revival) {
-            board[move.r2][move.c2] = '.';
+            if (!in_bounds(move.r2, move.c2)) {
+                return;
+            }
             int idx = index_of(move.piece);
             if (idx >= 0) {
                 if (red_turn) capRed[idx]++;
                 else capBlue[idx]++;
             }
+            board[move.r2][move.c2] = '.';
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return;
+            }
             char piece = board[move.r2][move.c2];
             board[move.r1][move.c1] = piece;
             board[move.r2][move.c2] = move.target;
@@ -317,7 +319,7 @@ private:
             }
         }
 
-        update_hash_for_move(move); // Undo the hash
+        refresh_hash(red_turn);
     }
     
     vector<Move> get_all_moves(bool is_red_turn) {
@@ -894,6 +896,11 @@ private:
     }
     
     Move get_best_move() {
+        if (transposition_table.size() > 500000) {
+            transposition_table.clear();
+        }
+
+        refresh_hash(isRed);
         vector<Move> moves = get_all_moves(isRed);
         if (moves.empty()) {
             return Move();
@@ -1109,8 +1116,8 @@ public:
             ourTurn = false;
         }
         
-        // Initialize hash after board setup
-        current_hash = compute_hash();
+        // Initialize hash after board setup (red to move at start)
+        refresh_hash(true);
         
         while (true) {
             // Check for 102-move draw rule
@@ -1200,53 +1207,22 @@ public:
                     int c1 = line[1] - '1';
                     int r2 = line[2] - 'a';
                     int c2 = line[3] - '1';
-                    
-                    char moving = board[r1][c1];
-                    char dest = board[r2][c2];
-                    
-                    // Update hash for opponent move
+
+                    char dest = in_bounds(r2, c2) ? board[r2][c2] : '.';
                     Move opp_move(r1, c1, r2, c2, dest);
-                    update_hash_for_move(opp_move);
-                    
-                    board[r2][c2] = moving;
-                    board[r1][c1] = '.';
-                    
-                    if (dest != '.') {
-                        int idx = index_of(dest);
-                        // When opponent captures our piece, THEY get it
-                        if (isRed) capBlue[idx]++;  // Opponent (Blue) captured our piece
-                        else capRed[idx]++;         // Opponent (Red) captured our piece
-                        
-                        if ((isRed && dest == 'w') || (!isRed && dest == 'W')) {
-                            break;
-                        }
-                    }
+                    bool opp_won = make_move(opp_move, !isRed);
                     move_count++;
+                    if (opp_won) break;
                 } else if (line.length() == 3) {
                     char piece = line[0];
                     int r = line[1] - 'a';
                     int c = line[2] - '1';
-                    
-                    // Update hash for opponent revival
+
                     Move opp_move(piece, r, c);
-                    update_hash_for_move(opp_move);
-                    
-                    board[r][c] = piece;
-                    int idx = index_of(piece);
-                    
-                    // Opponent is reviving their piece from their captures
-                    if ((isRed && is_lower(piece)) || (!isRed && is_upper(piece))) {
-                        // Opponent (Blue if we're Red, Red if we're Blue) revives their piece
-                        if (isRed) capBlue[idx]--;  // Blue uses their capture
-                        else capRed[idx]--;         // Red uses their capture
-                    } else {
-                        // Shouldn't happen - opponent reviving our piece?
-                        if (isRed) capRed[idx]--;
-                        else capBlue[idx]--;
-                    }
+                    make_move(opp_move, !isRed);
                     move_count++;
                 }
-                
+
                 ourTurn = true;
             }
         }
