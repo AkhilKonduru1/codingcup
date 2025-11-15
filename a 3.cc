@@ -221,29 +221,40 @@ private:
     
     bool is_valid_move(const Move& move, bool is_red_turn) {
         if (move.is_revival) {
+            if (!in_bounds(move.r2, move.c2)) return false;
             if (board[move.r2][move.c2] != '.') return false;
-            
+
+            if (is_red_turn) {
+                if (!is_upper(move.piece)) return false;
+            } else {
+                if (!is_lower(move.piece)) return false;
+            }
+
             int idx = index_of(move.piece);
             if (idx == -1) return false;
-            
+
             int* captured = is_red_turn ? capRed : capBlue;
             if (captured[idx] <= 0) return false;
-            
+
             return true;
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return false;
+            }
+
             char piece = board[move.r1][move.c1];
             if (piece == '.') return false;
-            
+
             if (is_red_turn && !is_upper(piece)) return false;
             if (!is_red_turn && !is_lower(piece)) return false;
-            
+
             if (move.target != '.') {
-                if ((is_red_turn && is_upper(move.target)) || 
+                if ((is_red_turn && is_upper(move.target)) ||
                     (!is_red_turn && is_lower(move.target))) {
                     return false;
                 }
             }
-            
+
             return true;
         }
     }
@@ -343,36 +354,64 @@ private:
             }
         }
         
-        // Revival moves - limit to avoid excessive computation
+        // Revival moves - consider wide coverage but prioritise promising squares
         int* captured = is_red_turn ? capRed : capBlue;
-        int revival_count = 0;
-        for (int i = 0; i < 5 && revival_count < 10; i++) { // Limit revival moves
-            if (captured[i] > 0) {
-                char piece;
-                if (is_red_turn) {
-                    char pieces[] = {'W', 'N', 'F', 'D', 'A'};
-                    piece = pieces[i];
-                } else {
-                    char pieces[] = {'w', 'n', 'f', 'd', 'a'};
-                    piece = pieces[i];
+        int opp_w_r = -1, opp_w_c = -1;
+        bool has_opp_w = find_king_position(!is_red_turn, opp_w_r, opp_w_c);
+
+        struct RevivalSquare {
+            int score;
+            int r;
+            int c;
+        };
+
+        vector<RevivalSquare> empty_squares;
+        empty_squares.reserve(32);
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (board[r][c] != '.') continue;
+
+                double center_distance = abs(r - 3.5) + abs(c - 3.5);
+                int center_score = max(0, 60 - static_cast<int>(center_distance * 12));
+
+                int pressure_score = 0;
+                if (has_opp_w) {
+                    double wazir_distance = abs(r - opp_w_r) + abs(c - opp_w_c);
+                    pressure_score = max(0, 50 - static_cast<int>(wazir_distance * 12));
                 }
-                
-                // Only check strategic positions for revival
-                vector<pair<int,int>> strategic_positions = {
-                    {3,3}, {3,4}, {4,3}, {4,4}, // Center
-                    {2,2}, {2,5}, {5,2}, {5,5}, // Near center
-                    {1,3}, {1,4}, {6,3}, {6,4}  // Development squares
-                };
-                
-                for (auto pos : strategic_positions) {
-                    if (board[pos.first][pos.second] == '.') {
-                        Move revival_move(piece, pos.first, pos.second);
-                        if (is_valid_move(revival_move, is_red_turn)) {
-                            moves.push_back(revival_move);
-                            revival_count++;
-                            if (revival_count >= 10) break;
-                        }
-                    }
+
+                bool back_rank = is_red_turn ? (r <= 1) : (r >= 6);
+                int back_rank_bonus = back_rank ? 12 : 0;
+
+                empty_squares.push_back({center_score + pressure_score + back_rank_bonus, r, c});
+            }
+        }
+
+        sort(empty_squares.begin(), empty_squares.end(), [](const RevivalSquare& a, const RevivalSquare& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.r != b.r) return a.r < b.r;
+            return a.c < b.c;
+        });
+
+        size_t revival_square_limit = min<size_t>(empty_squares.size(), 24);
+
+        for (int i = 0; i < 5; i++) {
+            if (captured[i] <= 0) continue;
+
+            char piece;
+            if (is_red_turn) {
+                static const char red_pieces[] = {'W', 'N', 'F', 'D', 'A'};
+                piece = red_pieces[i];
+            } else {
+                static const char blue_pieces[] = {'w', 'n', 'f', 'd', 'a'};
+                piece = blue_pieces[i];
+            }
+
+            for (size_t idx = 0; idx < revival_square_limit; idx++) {
+                const RevivalSquare& sq = empty_squares[idx];
+                Move revival_move(piece, sq.r, sq.c);
+                if (is_valid_move(revival_move, is_red_turn)) {
+                    moves.push_back(revival_move);
                 }
             }
         }
@@ -710,8 +749,10 @@ private:
     }
     
     int quiescence(int alpha, int beta, bool is_red_turn) {
+        int perspective = (is_red_turn == isRed) ? 1 : -1;
+
         // Stand-pat evaluation
-        int stand_pat = evaluate_board();
+        int stand_pat = evaluate_board() * perspective;
         if (stand_pat >= beta) return stand_pat;
         if (stand_pat > alpha) alpha = stand_pat;
         
@@ -794,16 +835,35 @@ private:
 
         order_moves(moves, is_red_turn, ply, tt_move);
 
-        // Adaptive move pruning based on depth
+        // Adaptive move pruning based on depth while keeping all forcing moves
         if (!in_check) {
-            int max_moves = 30;
-            if (search_depth >= 4) max_moves = 10;
-            else if (search_depth >= 3) max_moves = 15;
-            else if (search_depth >= 2) max_moves = 20;
+            int quiet_limit = 30;
+            if (search_depth >= 4) quiet_limit = 10;
+            else if (search_depth >= 3) quiet_limit = 15;
+            else if (search_depth >= 2) quiet_limit = 20;
 
-            if (moves.size() > (size_t)max_moves) {
-                moves.resize(max_moves);
+            vector<Move> forcing_moves;
+            vector<Move> quiet_moves;
+            forcing_moves.reserve(moves.size());
+            quiet_moves.reserve(moves.size());
+
+            for (const Move& mv : moves) {
+                bool wazir_move = !mv.is_revival && toupper(board[mv.r1][mv.c1]) == 'W';
+                if (mv.is_capture || mv.is_revival || wazir_move) {
+                    forcing_moves.push_back(mv);
+                } else {
+                    quiet_moves.push_back(mv);
+                }
             }
+
+            if (quiet_moves.size() > static_cast<size_t>(quiet_limit)) {
+                quiet_moves.resize(quiet_limit);
+            }
+
+            moves.clear();
+            moves.reserve(forcing_moves.size() + quiet_moves.size());
+            moves.insert(moves.end(), forcing_moves.begin(), forcing_moves.end());
+            moves.insert(moves.end(), quiet_moves.begin(), quiet_moves.end());
         }
 
         int best_score = INT_MIN;
