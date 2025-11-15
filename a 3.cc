@@ -419,6 +419,67 @@ private:
         }
     }
 
+    bool find_king_position(bool red_king, int& out_r, int& out_c) {
+        out_r = -1;
+        out_c = -1;
+        char target = red_king ? 'W' : 'w';
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (board[r][c] == target) {
+                    out_r = r;
+                    out_c = c;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    int count_attackers_on_square(int r, int c, bool attackers_are_red) {
+        if (r < 0 || r >= 8 || c < 0 || c >= 8) return 0;
+
+        int count = 0;
+        auto consider = [&](int sr, int sc, char piece_type) {
+            if (sr < 0 || sr >= 8 || sc < 0 || sc >= 8) return;
+            char piece = board[sr][sc];
+            if (piece == '.') return;
+            if (attackers_are_red) {
+                if (!is_upper(piece)) return;
+            } else {
+                if (!is_lower(piece)) return;
+            }
+            if (toupper(piece) == piece_type) {
+                count++;
+            }
+        };
+
+        for (int i = 0; i < 4; i++) {
+            consider(r - drW[i], c - dcW[i], 'W');
+        }
+        for (int i = 0; i < 8; i++) {
+            consider(r - drN[i], c - dcN[i], 'N');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drF[i], c - dcF[i], 'F');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drD[i], c - dcD[i], 'D');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drA[i], c - dcA[i], 'A');
+        }
+
+        return count;
+    }
+
+    bool is_in_check(bool red_turn) {
+        int kr = -1, kc = -1;
+        if (!find_king_position(red_turn, kr, kc)) {
+            return false;
+        }
+        return count_attackers_on_square(kr, kc, !red_turn) > 0;
+    }
+
     int evaluate_endgame() {
         int score = 0;
 
@@ -461,6 +522,10 @@ private:
         int tactical_score = 0;
 
         compute_attack_maps(attack_red, attack_blue, mobility_red, mobility_blue, tactical_score);
+
+        int red_king_r, red_king_c, blue_king_r, blue_king_c;
+        find_king_position(true, red_king_r, red_king_c);
+        find_king_position(false, blue_king_r, blue_king_c);
 
         int score = tactical_score;
 
@@ -543,6 +608,19 @@ private:
                 score += capBlue[i] * piece_value;
                 score -= capRed[i] * piece_value;
             }
+        }
+
+        int red_king_attackers = red_king_r >= 0 ? count_attackers_on_square(red_king_r, red_king_c, false) : 0;
+        int blue_king_attackers = blue_king_r >= 0 ? count_attackers_on_square(blue_king_r, blue_king_c, true) : 0;
+
+        int our_king_attackers = isRed ? red_king_attackers : blue_king_attackers;
+        int opp_king_attackers = isRed ? blue_king_attackers : red_king_attackers;
+
+        if (our_king_attackers > 0) {
+            score -= 800 + 220 * (our_king_attackers - 1);
+        }
+        if (opp_king_attackers > 0) {
+            score += 800 + 200 * (opp_king_attackers - 1);
         }
 
         score += evaluate_endgame();
@@ -675,13 +753,17 @@ private:
         if (elapsed > time_limit * 0.85) {
             return evaluate_board() * (is_red_turn == isRed ? 1 : -1);
         }
-        
+
+        bool in_check = is_in_check(is_red_turn);
+        int extension_current = (in_check && depth > 0) ? 1 : 0;
+        int search_depth = depth + extension_current;
+
         // Check transposition table
         TTEntry* tt_entry = nullptr;
         Move* tt_move = nullptr;
         if (transposition_table.count(current_hash)) {
             tt_entry = &transposition_table[current_hash];
-            if (tt_entry->depth >= depth) {
+            if (tt_entry->depth >= search_depth) {
                 if (tt_entry->flag == 0) { // Exact score
                     return tt_entry->score;
                 } else if (tt_entry->flag == 1) { // Lower bound
@@ -695,63 +777,74 @@ private:
             }
             tt_move = &tt_entry->best_move;
         }
-        
-        if (depth <= 0) {
+
+        if (search_depth <= 0) {
             return quiescence(alpha, beta, is_red_turn);
         }
-        
+
         vector<Move> moves = get_all_moves(is_red_turn);
         if (moves.empty()) {
+            if (in_check) {
+                return (is_red_turn == isRed) ? (-100000 + ply) : (100000 - ply);
+            }
             return evaluate_board() * (is_red_turn == isRed ? 1 : -1);
         }
-        
+
         order_moves(moves, is_red_turn, ply, tt_move);
-        
+
         // Adaptive move pruning based on depth
-        int max_moves = 30;
-        if (depth >= 4) max_moves = 10;
-        else if (depth >= 3) max_moves = 15;
-        else if (depth >= 2) max_moves = 20;
-        
-        if (moves.size() > (size_t)max_moves) {
-            moves.resize(max_moves);
+        if (!in_check) {
+            int max_moves = 30;
+            if (search_depth >= 4) max_moves = 10;
+            else if (search_depth >= 3) max_moves = 15;
+            else if (search_depth >= 2) max_moves = 20;
+
+            if (moves.size() > (size_t)max_moves) {
+                moves.resize(max_moves);
+            }
         }
-        
+
         int best_score = INT_MIN;
         Move best_move;
         int original_alpha = alpha;
-        
+
         for (size_t i = 0; i < moves.size(); i++) {
             const Move& move = moves[i];
             if (!is_valid_move(move, is_red_turn)) continue;
-            
+
             // Time check for deep searches
-            if (i > 5 && depth >= 2) {
+            if (i > 5 && search_depth >= 2) {
                 auto current_time = chrono::steady_clock::now();
                 double elapsed = chrono::duration<double>(current_time - start_time).count();
                 if (elapsed > time_limit * 0.7) break;
             }
-            
+
             bool won = make_move(move, is_red_turn);
             if (won) {
                 unmake_move(move, is_red_turn);
                 int win_score = 100000 - ply;
-                
+
                 // Store in TT
                 TTEntry entry;
                 entry.hash = current_hash;
-                entry.depth = depth;
+                entry.depth = search_depth;
                 entry.score = win_score;
                 entry.flag = 0;
                 entry.best_move = move;
                 transposition_table[current_hash] = entry;
-                
+
                 return win_score;
             }
-            
-            int score = -negamax(depth - 1, -beta, -alpha, !is_red_turn, ply + 1);
+
+            bool opponent_in_check = is_in_check(!is_red_turn);
+            int next_depth = search_depth - 1;
+            if (opponent_in_check && next_depth > 0) {
+                next_depth++;
+            }
+
+            int score = -negamax(next_depth, -beta, -alpha, !is_red_turn, ply + 1);
             unmake_move(move, is_red_turn);
-            
+
             if (score > best_score) {
                 best_score = score;
                 best_move = move;
@@ -768,16 +861,16 @@ private:
                     }
                 }
                 if (!move.is_revival) {
-                    history[move.r1][move.c1][move.r2][move.c2] += depth * depth;
+                    history[move.r1][move.c1][move.r2][move.c2] += search_depth * search_depth;
                 }
                 break;
             }
         }
-        
+
         // Store in transposition table
         TTEntry entry;
         entry.hash = current_hash;
-        entry.depth = depth;
+        entry.depth = search_depth;
         entry.score = best_score;
         if (best_score <= original_alpha) {
             entry.flag = 2; // Upper bound
@@ -793,29 +886,11 @@ private:
     }
     
     bool has_critical_threat() {
-        int attack_red[8][8] = {};
-        int attack_blue[8][8] = {};
-        int mobility_red = 0;
-        int mobility_blue = 0;
-        int tactical = 0;
-        compute_attack_maps(attack_red, attack_blue, mobility_red, mobility_blue, tactical);
-
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                char piece = board[r][c];
-                if (piece == '.') continue;
-
-                bool is_our_king = (isRed && piece == 'W') || (!isRed && piece == 'w');
-                if (is_our_king) {
-                    bool under_attack = isRed ? (attack_blue[r][c] > 0)
-                                              : (attack_red[r][c] > 0);
-                    if (under_attack) {
-                        return true;
-                    }
-                }
-            }
+        int kr, kc;
+        if (!find_king_position(isRed, kr, kc)) {
+            return true;
         }
-        return false;
+        return count_attackers_on_square(kr, kc, !isRed) > 0;
     }
     
     Move get_best_move() {
@@ -837,21 +912,24 @@ private:
         // Iterative deepening
         Move best_move;
         int best_score = INT_MIN;
-        
+
+        bool urgent = has_critical_threat();
+
         for (int depth = 1; depth <= 20; depth++) {
             auto current_time = chrono::steady_clock::now();
             double elapsed = chrono::duration<double>(current_time - start_time).count();
-            
+
             // Stop if we're running out of time
-            if (elapsed > time_limit * 0.8) {
+            double soft_cap = urgent ? 0.9 : 0.8;
+            if (elapsed > time_limit * soft_cap) {
                 break;
             }
-            
+
             // Estimate if we have time for next depth
-            if (depth > 3 && elapsed > time_limit * 0.5) {
+            if (!urgent && depth > 3 && elapsed > time_limit * 0.5) {
                 break;
             }
-            
+
             int depth_best_score = INT_MIN;
             Move depth_best_move;
             
@@ -866,13 +944,14 @@ private:
             bool completed_depth = false;
             for (const Move& move : moves) {
                 if (!is_valid_move(move, isRed)) continue;
-                
+
                 current_time = chrono::steady_clock::now();
                 elapsed = chrono::duration<double>(current_time - start_time).count();
-                if (elapsed > time_limit * 0.85) {
+                double hard_cap = urgent ? 0.95 : 0.85;
+                if (elapsed > time_limit * hard_cap) {
                     break;
                 }
-                
+
                 bool won = make_move(move, isRed);
                 if (won) {
                     unmake_move(move, isRed);
