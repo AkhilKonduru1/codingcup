@@ -5,6 +5,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cctype>
 #include <unordered_map>
 #include <random>
 
@@ -26,12 +27,7 @@ const int dcA[] = {2, -2, 2, -2};
 const int PIECE_VALUES[] = {10000, 500, 400, 300, 200}; // W, N, F, D, A
 
 // Evaluation constants
-const int CENTER_BONUS = 30;
-const int DEVELOPMENT_BONUS = 15;
-const int KING_SAFETY_BONUS = 100;
 const int MOBILITY_BONUS = 5;
-const int THREAT_BONUS = 20;
-const int DEFENSE_BONUS = 10;
 
 // Optimized opening book for better bot performance
 // Each string must have: 1W + 1N + 2F + 4D + 8A = 16 pieces
@@ -118,15 +114,15 @@ private:
     // History heuristic
     int history[8][8][8][8]; // [from_r][from_c][to_r][to_c]
     
-    bool is_upper(char c) {
+    bool is_upper(char c) const {
         return c >= 'A' && c <= 'Z';
     }
-    
-    bool is_lower(char c) {
+
+    bool is_lower(char c) const {
         return c >= 'a' && c <= 'z';
     }
-    
-    int index_of(char c) {
+
+    int index_of(char c) const {
         char u = toupper(c);
         switch(u) {
             case 'W': return 0;
@@ -137,22 +133,26 @@ private:
             default: return -1;
         }
     }
-    
-    int get_piece_value(char piece) {
+
+    int get_piece_value(char piece) const {
         if (piece == '.') return 0;
         int idx = index_of(piece);
         return idx >= 0 ? PIECE_VALUES[idx] : 0;
     }
-    
-    int piece_to_zobrist_index(char piece) {
+
+    int piece_to_zobrist_index(char piece) const {
         if (piece == '.') return -1;
         int base_idx = index_of(piece);
         if (base_idx < 0) return -1;
         // Upper case (Red) = 0-5, Lower case (Blue) = 6-11
         return is_upper(piece) ? base_idx : base_idx + 6;
     }
-    
-    uint64_t compute_hash() {
+
+    bool in_bounds(int r, int c) const {
+        return r >= 0 && r < 8 && c >= 0 && c < 8;
+    }
+
+    uint64_t compute_position_hash(bool red_to_move) const {
         uint64_t hash = 0;
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
@@ -162,35 +162,12 @@ private:
                 }
             }
         }
-        if (!isRed) hash ^= zobrist_turn;
+        if (red_to_move) hash ^= zobrist_turn;
         return hash;
     }
-    
-    void update_hash_for_move(const Move& move) {
-        if (move.is_revival) {
-            int p_idx = piece_to_zobrist_index(move.piece);
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r2][move.c2][p_idx];
-            }
-        } else {
-            // Remove piece from source
-            int p_idx = piece_to_zobrist_index(board[move.r1][move.c1]);
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r1][move.c1][p_idx];
-            }
-            // Remove captured piece from destination
-            if (move.target != '.') {
-                int t_idx = piece_to_zobrist_index(move.target);
-                if (t_idx >= 0) {
-                    current_hash ^= zobrist[move.r2][move.c2][t_idx];
-                }
-            }
-            // Add piece to destination
-            if (p_idx >= 0) {
-                current_hash ^= zobrist[move.r2][move.c2][p_idx];
-            }
-        }
-        current_hash ^= zobrist_turn; // Toggle turn
+
+    void refresh_hash(bool red_to_move) {
+        current_hash = compute_position_hash(red_to_move);
     }
     
     vector<Move> get_piece_moves(int r, int c, char piece) {
@@ -244,81 +221,116 @@ private:
     
     bool is_valid_move(const Move& move, bool is_red_turn) {
         if (move.is_revival) {
+            if (!in_bounds(move.r2, move.c2)) return false;
             if (board[move.r2][move.c2] != '.') return false;
-            
+
+            if (is_red_turn) {
+                if (!is_upper(move.piece)) return false;
+            } else {
+                if (!is_lower(move.piece)) return false;
+            }
+
             int idx = index_of(move.piece);
             if (idx == -1) return false;
-            
+
             int* captured = is_red_turn ? capRed : capBlue;
             if (captured[idx] <= 0) return false;
-            
+
             return true;
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return false;
+            }
+
             char piece = board[move.r1][move.c1];
             if (piece == '.') return false;
-            
+
             if (is_red_turn && !is_upper(piece)) return false;
             if (!is_red_turn && !is_lower(piece)) return false;
-            
+
             if (move.target != '.') {
-                if ((is_red_turn && is_upper(move.target)) || 
+                if ((is_red_turn && is_upper(move.target)) ||
                     (!is_red_turn && is_lower(move.target))) {
                     return false;
                 }
             }
-            
+
             return true;
         }
     }
     
-    bool make_move(const Move& move) {
-        update_hash_for_move(move);
-        
+    bool make_move(const Move& move, bool red_turn) {
         if (move.is_revival) {
+            if (!in_bounds(move.r2, move.c2) || board[move.r2][move.c2] != '.') {
+                return false;
+            }
             board[move.r2][move.c2] = move.piece;
             int idx = index_of(move.piece);
-            if ((isRed && is_upper(move.piece)) || (!isRed && is_lower(move.piece))) {
-                if (isRed) capRed[idx]--;
-                else capBlue[idx]--;
+            if (idx >= 0) {
+                int* captured = red_turn ? capRed : capBlue;
+                if (captured[idx] <= 0) {
+                    board[move.r2][move.c2] = '.';
+                    return false;
+                }
+                captured[idx]--;
             }
+            refresh_hash(!red_turn);
             return false;
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return false;
+            }
             char piece = board[move.r1][move.c1];
+            if (piece == '.') {
+                return false;
+            }
+
+            char captured = board[move.r2][move.c2];
             board[move.r2][move.c2] = piece;
             board[move.r1][move.c1] = '.';
-            
-            if (move.target != '.') {
-                int idx = index_of(move.target);
-                if (isRed) capRed[idx]++;
-                else capBlue[idx]++;
-                
-                return toupper(move.target) == 'W';
+
+            if (captured != '.') {
+                int idx = index_of(captured);
+                if (idx >= 0) {
+                    if (red_turn) capRed[idx]++;
+                    else capBlue[idx]++;
+                }
             }
+
+            refresh_hash(!red_turn);
+            return captured != '.' && toupper(captured) == 'W';
         }
-        return false;
     }
-    
-    void unmake_move(const Move& move) {
+
+    void unmake_move(const Move& move, bool red_turn) {
         if (move.is_revival) {
-            board[move.r2][move.c2] = '.';
+            if (!in_bounds(move.r2, move.c2)) {
+                return;
+            }
             int idx = index_of(move.piece);
-            if ((isRed && is_upper(move.piece)) || (!isRed && is_lower(move.piece))) {
-                if (isRed) capRed[idx]++;
+            if (idx >= 0) {
+                if (red_turn) capRed[idx]++;
                 else capBlue[idx]++;
             }
+            board[move.r2][move.c2] = '.';
         } else {
+            if (!in_bounds(move.r1, move.c1) || !in_bounds(move.r2, move.c2)) {
+                return;
+            }
             char piece = board[move.r2][move.c2];
             board[move.r1][move.c1] = piece;
             board[move.r2][move.c2] = move.target;
-            
+
             if (move.target != '.') {
                 int idx = index_of(move.target);
-                if (isRed) capRed[idx]--;
-                else capBlue[idx]--;
+                if (idx >= 0) {
+                    if (red_turn) capRed[idx]--;
+                    else capBlue[idx]--;
+                }
             }
         }
-        
-        update_hash_for_move(move); // Undo the hash
+
+        refresh_hash(red_turn);
     }
     
     vector<Move> get_all_moves(bool is_red_turn) {
@@ -342,36 +354,64 @@ private:
             }
         }
         
-        // Revival moves - limit to avoid excessive computation
+        // Revival moves - consider wide coverage but prioritise promising squares
         int* captured = is_red_turn ? capRed : capBlue;
-        int revival_count = 0;
-        for (int i = 0; i < 5 && revival_count < 10; i++) { // Limit revival moves
-            if (captured[i] > 0) {
-                char piece;
-                if (is_red_turn) {
-                    char pieces[] = {'W', 'N', 'F', 'D', 'A'};
-                    piece = pieces[i];
-                } else {
-                    char pieces[] = {'w', 'n', 'f', 'd', 'a'};
-                    piece = pieces[i];
+        int opp_w_r = -1, opp_w_c = -1;
+        bool has_opp_w = find_king_position(!is_red_turn, opp_w_r, opp_w_c);
+
+        struct RevivalSquare {
+            int score;
+            int r;
+            int c;
+        };
+
+        vector<RevivalSquare> empty_squares;
+        empty_squares.reserve(32);
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (board[r][c] != '.') continue;
+
+                double center_distance = abs(r - 3.5) + abs(c - 3.5);
+                int center_score = max(0, 60 - static_cast<int>(center_distance * 12));
+
+                int pressure_score = 0;
+                if (has_opp_w) {
+                    double wazir_distance = abs(r - opp_w_r) + abs(c - opp_w_c);
+                    pressure_score = max(0, 50 - static_cast<int>(wazir_distance * 12));
                 }
-                
-                // Only check strategic positions for revival
-                vector<pair<int,int>> strategic_positions = {
-                    {3,3}, {3,4}, {4,3}, {4,4}, // Center
-                    {2,2}, {2,5}, {5,2}, {5,5}, // Near center
-                    {1,3}, {1,4}, {6,3}, {6,4}  // Development squares
-                };
-                
-                for (auto pos : strategic_positions) {
-                    if (board[pos.first][pos.second] == '.') {
-                        Move revival_move(piece, pos.first, pos.second);
-                        if (is_valid_move(revival_move, is_red_turn)) {
-                            moves.push_back(revival_move);
-                            revival_count++;
-                            if (revival_count >= 10) break;
-                        }
-                    }
+
+                bool back_rank = is_red_turn ? (r <= 1) : (r >= 6);
+                int back_rank_bonus = back_rank ? 12 : 0;
+
+                empty_squares.push_back({center_score + pressure_score + back_rank_bonus, r, c});
+            }
+        }
+
+        sort(empty_squares.begin(), empty_squares.end(), [](const RevivalSquare& a, const RevivalSquare& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.r != b.r) return a.r < b.r;
+            return a.c < b.c;
+        });
+
+        size_t revival_square_limit = min<size_t>(empty_squares.size(), 24);
+
+        for (int i = 0; i < 5; i++) {
+            if (captured[i] <= 0) continue;
+
+            char piece;
+            if (is_red_turn) {
+                static const char red_pieces[] = {'W', 'N', 'F', 'D', 'A'};
+                piece = red_pieces[i];
+            } else {
+                static const char blue_pieces[] = {'w', 'n', 'f', 'd', 'a'};
+                piece = blue_pieces[i];
+            }
+
+            for (size_t idx = 0; idx < revival_square_limit; idx++) {
+                const RevivalSquare& sq = empty_squares[idx];
+                Move revival_move(piece, sq.r, sq.c);
+                if (is_valid_move(revival_move, is_red_turn)) {
+                    moves.push_back(revival_move);
                 }
             }
         }
@@ -379,110 +419,114 @@ private:
         return moves;
     }
     
-    int count_mobility(int r, int c, char piece) {
-        vector<Move> moves = get_piece_moves(r, c, piece);
-        return moves.size();
-    }
-    
-    int calculate_threats(int r, int c, char piece) {
-        int threats = 0;
-        vector<Move> moves = get_piece_moves(r, c, piece);
-        for (const Move& move : moves) {
-            if (move.target != '.') {
-                if ((isRed && is_lower(move.target)) || (!isRed && is_upper(move.target))) {
-                    threats++;
-                }
-            }
-        }
-        return threats;
-    }
-    
-    int calculate_defense(int r, int c, char piece) {
-        int defense = 0;
-        vector<Move> moves = get_piece_moves(r, c, piece);
-        for (const Move& move : moves) {
-            if (move.target != '.') {
-                if ((isRed && is_upper(move.target)) || (!isRed && is_lower(move.target))) {
-                    defense++;
-                }
-            }
-        }
-        return defense;
-    }
-    
-    int get_positional_bonus(int r, int c, char piece) {
-        int bonus = 0;
-        
-        // Center control
-        double center_distance = abs(r - 3.5) + abs(c - 3.5);
-        bonus += max(0, CENTER_BONUS - (int)(center_distance * 3));
-        
-        // Development
-        if (isRed) {
-            if (r <= 1) bonus += DEVELOPMENT_BONUS;
-        } else {
-            if (r >= 6) bonus += DEVELOPMENT_BONUS;
-        }
-        
-        // King safety
-        if (toupper(piece) == 'W') {
-            int friendly_count = 0;
-            for (int dr = -1; dr <= 1; dr++) {
-                for (int dc = -1; dc <= 1; dc++) {
-                    int nr = r + dr;
-                    int nc = c + dc;
-                    if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
-                        if (board[nr][nc] != '.') {
-                            if ((isRed && is_upper(board[nr][nc])) || 
-                                (!isRed && is_lower(board[nr][nc]))) {
-                                friendly_count++;
-                            }
+    void compute_attack_maps(int attack_red[8][8], int attack_blue[8][8],
+                             int& mobility_red, int& mobility_blue, int& tactical_score) {
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                char piece = board[r][c];
+                if (piece == '.') continue;
+
+                bool red_piece = is_upper(piece);
+                bool our_piece = (isRed && red_piece) || (!isRed && !red_piece);
+
+                vector<Move> moves = get_piece_moves(r, c, piece);
+                int enemy_targets = 0;
+
+                for (const Move& move : moves) {
+                    if (red_piece) attack_red[move.r2][move.c2]++;
+                    else attack_blue[move.r2][move.c2]++;
+
+                    char target = board[move.r2][move.c2];
+                    bool friendly_target = (red_piece && is_upper(target)) ||
+                                           (!red_piece && is_lower(target));
+
+                    if (!friendly_target) {
+                        if (red_piece) mobility_red++;
+                        else mobility_blue++;
+
+                        if (target != '.' &&
+                            ((red_piece && is_lower(target)) ||
+                             (!red_piece && is_upper(target)))) {
+                            enemy_targets++;
                         }
                     }
                 }
-            }
-            bonus += friendly_count * KING_SAFETY_BONUS;
-            
-            if (isRed && r > 2) bonus += 50;
-            else if (!isRed && r < 5) bonus += 50;
-        }
-        
-        // Mobility
-        int mobility = count_mobility(r, c, piece);
-        bonus += mobility * MOBILITY_BONUS;
-        
-        // Threats
-        int threat_bonus = calculate_threats(r, c, piece);
-        bonus += threat_bonus * THREAT_BONUS;
-        
-        // Defense
-        int defense_bonus = calculate_defense(r, c, piece);
-        bonus += defense_bonus * DEFENSE_BONUS;
-        
-        return bonus;
-    }
-    
-    bool is_double_attack(int r, int c, char piece) {
-        vector<Move> moves = get_piece_moves(r, c, piece);
-        int enemy_targets = 0;
-        
-        for (const Move& move : moves) {
-            if (move.target != '.') {
-                if ((isRed && is_lower(move.target)) || (!isRed && is_upper(move.target))) {
-                    enemy_targets++;
+
+                if (enemy_targets >= 2) {
+                    int piece_value = get_piece_value(piece);
+                    tactical_score += our_piece ? piece_value / 2 : -piece_value / 2;
                 }
             }
         }
-        
-        return enemy_targets >= 2;
     }
-    
+
+    bool find_king_position(bool red_king, int& out_r, int& out_c) {
+        out_r = -1;
+        out_c = -1;
+        char target = red_king ? 'W' : 'w';
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (board[r][c] == target) {
+                    out_r = r;
+                    out_c = c;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    int count_attackers_on_square(int r, int c, bool attackers_are_red) {
+        if (r < 0 || r >= 8 || c < 0 || c >= 8) return 0;
+
+        int count = 0;
+        auto consider = [&](int sr, int sc, char piece_type) {
+            if (sr < 0 || sr >= 8 || sc < 0 || sc >= 8) return;
+            char piece = board[sr][sc];
+            if (piece == '.') return;
+            if (attackers_are_red) {
+                if (!is_upper(piece)) return;
+            } else {
+                if (!is_lower(piece)) return;
+            }
+            if (toupper(piece) == piece_type) {
+                count++;
+            }
+        };
+
+        for (int i = 0; i < 4; i++) {
+            consider(r - drW[i], c - dcW[i], 'W');
+        }
+        for (int i = 0; i < 8; i++) {
+            consider(r - drN[i], c - dcN[i], 'N');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drF[i], c - dcF[i], 'F');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drD[i], c - dcD[i], 'D');
+        }
+        for (int i = 0; i < 4; i++) {
+            consider(r - drA[i], c - dcA[i], 'A');
+        }
+
+        return count;
+    }
+
+    bool is_in_check(bool red_turn) {
+        int kr = -1, kc = -1;
+        if (!find_king_position(red_turn, kr, kc)) {
+            return false;
+        }
+        return count_attackers_on_square(kr, kc, !red_turn) > 0;
+    }
+
     int evaluate_endgame() {
         int score = 0;
-        
+
         int red_pieces = 0;
         int blue_pieces = 0;
-        
+
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
                 if (board[r][c] != '.') {
@@ -510,125 +554,92 @@ private:
         
         return score;
     }
-    
-    int evaluate_tactical_patterns() {
-        int score = 0;
-        
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                char piece = board[r][c];
-                if (piece == '.') continue;
-                
-                if (is_double_attack(r, c, piece)) {
-                    int piece_value = get_piece_value(piece);
-                    if ((isRed && is_upper(piece)) || (!isRed && is_lower(piece))) {
-                        score += piece_value / 2;
-                    } else {
-                        score -= piece_value / 2;
-                    }
-                }
-            }
-        }
-        
-        return score;
-    }
-    
-    bool is_under_attack(int r, int c, char piece) {
-        // Check if our piece is under attack by enemy pieces
-        vector<Move> enemy_moves = get_all_moves(!isRed);
-        for (const Move& move : enemy_moves) {
-            if (move.r2 == r && move.c2 == c && move.target != '.') {
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    int count_defenders(int r, int c, char piece) {
-        // Count how many of our pieces can defend this square
-        int defenders = 0;
-        vector<Move> our_moves = get_all_moves(isRed);
-        for (const Move& move : our_moves) {
-            if (move.r2 == r && move.c2 == c) {
-                defenders++;
-            }
-        }
-        return defenders;
-    }
-    
+
     int evaluate_board() {
-        int score = 0;
-        
-        // Material and positional evaluation
-        int our_mobility = 0;
-        int opp_mobility = 0;
-        
+        int attack_red[8][8] = {};
+        int attack_blue[8][8] = {};
+        int mobility_red = 0;
+        int mobility_blue = 0;
+        int tactical_score = 0;
+
+        compute_attack_maps(attack_red, attack_blue, mobility_red, mobility_blue, tactical_score);
+
+        int red_king_r, red_king_c, blue_king_r, blue_king_c;
+        find_king_position(true, red_king_r, red_king_c);
+        find_king_position(false, blue_king_r, blue_king_c);
+
+        int score = tactical_score;
+
+        int our_mobility = isRed ? mobility_red : mobility_blue;
+        int opp_mobility = isRed ? mobility_blue : mobility_red;
+
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
                 char piece = board[r][c];
                 if (piece == '.') continue;
-                
+
                 int piece_value = get_piece_value(piece);
-                
-                // Center control bonus
+                bool red_piece = is_upper(piece);
+                bool our_piece = (isRed && red_piece) || (!isRed && !red_piece);
+
                 double center_distance = abs(r - 3.5) + abs(c - 3.5);
                 int center_bonus = max(0, 40 - (int)(center_distance * 4));
-                
-                // Mobility calculation
-                int mobility = count_mobility(r, c, piece);
-                
-                // Piece coordination bonus
+
                 int coordination_bonus = 0;
                 for (int dr = -1; dr <= 1; dr++) {
                     for (int dc = -1; dc <= 1; dc++) {
+                        if (dr == 0 && dc == 0) continue;
                         int nr = r + dr, nc = c + dc;
                         if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
                             char neighbor = board[nr][nc];
-                            if (neighbor != '.' && 
-                                ((is_upper(piece) && is_upper(neighbor)) || 
+                            if (neighbor != '.' &&
+                                ((is_upper(piece) && is_upper(neighbor)) ||
                                  (is_lower(piece) && is_lower(neighbor)))) {
-                                coordination_bonus += 15;
+                                coordination_bonus += 12;
                             }
                         }
                     }
                 }
-                
-                bool is_our_piece = (isRed && is_upper(piece)) || (!isRed && is_lower(piece));
-                
-                if (is_our_piece) {
+
+                if (our_piece) {
                     score += piece_value + center_bonus + coordination_bonus;
-                    our_mobility += mobility;
-                    
-                    // Positional bonuses from get_positional_bonus
+
                     int advancement_bonus = 0;
                     if (isRed && r >= 4) advancement_bonus = (r - 3) * 25;
                     else if (!isRed && r <= 3) advancement_bonus = (4 - r) * 25;
                     score += advancement_bonus;
-                    
-                    // Center square control
+
                     if ((r == 3 || r == 4) && (c == 3 || c == 4)) {
                         score += 60;
                     }
-                    
-                    // King safety
+
+                    int defenders = red_piece ? attack_red[r][c] : attack_blue[r][c];
+                    score += defenders * 8;
+
                     if (toupper(piece) == 'W') {
-                        int defenders = count_defenders(r, c, piece);
-                        score += defenders * 40;
-                        if (is_under_attack(r, c, piece)) {
+                        bool under_attack = red_piece ? (attack_blue[r][c] > 0)
+                                                      : (attack_red[r][c] > 0);
+                        score += defenders * 35;
+                        if (under_attack) {
                             score -= 150;
                         }
                     }
                 } else {
                     score -= piece_value + center_bonus;
-                    opp_mobility += mobility;
+
+                    if (toupper(piece) == 'W') {
+                        bool under_attack = red_piece ? (attack_blue[r][c] > 0)
+                                                      : (attack_red[r][c] > 0);
+                        if (under_attack) {
+                            score += 120;
+                        }
+                    }
                 }
             }
         }
-        
-        // Mobility bonus
+
         score += (our_mobility - opp_mobility) * MOBILITY_BONUS;
-        
-        // Material from captures
+
         for (int i = 0; i < 5; i++) {
             int piece_value = PIECE_VALUES[i];
             if (isRed) {
@@ -639,54 +650,23 @@ private:
                 score -= capRed[i] * piece_value;
             }
         }
-        
-        // Tactical patterns (forks, double attacks)
-        score += evaluate_tactical_patterns();
-        
-        // Endgame evaluation (king centralization)
+
+        int red_king_attackers = red_king_r >= 0 ? count_attackers_on_square(red_king_r, red_king_c, false) : 0;
+        int blue_king_attackers = blue_king_r >= 0 ? count_attackers_on_square(blue_king_r, blue_king_c, true) : 0;
+
+        int our_king_attackers = isRed ? red_king_attackers : blue_king_attackers;
+        int opp_king_attackers = isRed ? blue_king_attackers : red_king_attackers;
+
+        if (our_king_attackers > 0) {
+            score -= 800 + 220 * (our_king_attackers - 1);
+        }
+        if (opp_king_attackers > 0) {
+            score += 800 + 200 * (opp_king_attackers - 1);
+        }
+
         score += evaluate_endgame();
-        
+
         return score;
-    }
-    
-    bool is_defensive_move(const Move& move, bool is_red_turn) {
-        if (move.is_revival) return false;
-        
-        // Check if this move defends one of our pieces
-        char piece = board[move.r1][move.c1];
-        if (piece == '.') return false;
-        
-        // Check if the destination defends any of our pieces
-        vector<Move> our_moves = get_all_moves(is_red_turn);
-        for (const Move& our_move : our_moves) {
-            if (our_move.r2 == move.r2 && our_move.c2 == move.c2) {
-                char target_piece = board[our_move.r1][our_move.c1];
-                if (is_under_attack(our_move.r1, our_move.c1, target_piece)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    
-    bool is_aggressive_move(const Move& move, bool is_red_turn) {
-        if (move.is_revival) return false;
-        
-        // Check if this move attacks enemy pieces
-        char piece = board[move.r1][move.c1];
-        if (piece == '.') return false;
-        
-        // Check if the destination threatens enemy pieces
-        vector<Move> our_moves = get_all_moves(is_red_turn);
-        for (const Move& our_move : our_moves) {
-            if (our_move.r2 == move.r2 && our_move.c2 == move.c2) {
-                char target_piece = board[our_move.r1][our_move.c1];
-                if (is_under_attack(our_move.r1, our_move.c1, target_piece)) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
     
     void order_moves(vector<Move>& moves, bool is_red_turn, int ply, Move* tt_move = nullptr) {
@@ -769,8 +749,10 @@ private:
     }
     
     int quiescence(int alpha, int beta, bool is_red_turn) {
+        int perspective = (is_red_turn == isRed) ? 1 : -1;
+
         // Stand-pat evaluation
-        int stand_pat = evaluate_board();
+        int stand_pat = evaluate_board() * perspective;
         if (stand_pat >= beta) return stand_pat;
         if (stand_pat > alpha) alpha = stand_pat;
         
@@ -796,9 +778,9 @@ private:
             double elapsed = chrono::duration<double>(current_time - start_time).count();
             if (elapsed > time_limit * 0.6) break; // Much stricter limit for quiescence
             
-            make_move(mv);
+            make_move(mv, is_red_turn);
             int score = -quiescence(-beta, -alpha, !is_red_turn);
-            unmake_move(mv);
+            unmake_move(mv, is_red_turn);
             
             if (score >= beta) return score;
             if (score > alpha) alpha = score;
@@ -814,13 +796,17 @@ private:
         if (elapsed > time_limit * 0.85) {
             return evaluate_board() * (is_red_turn == isRed ? 1 : -1);
         }
-        
+
+        bool in_check = is_in_check(is_red_turn);
+        int extension_current = (in_check && depth > 0) ? 1 : 0;
+        int search_depth = depth + extension_current;
+
         // Check transposition table
         TTEntry* tt_entry = nullptr;
         Move* tt_move = nullptr;
         if (transposition_table.count(current_hash)) {
             tt_entry = &transposition_table[current_hash];
-            if (tt_entry->depth >= depth) {
+            if (tt_entry->depth >= search_depth) {
                 if (tt_entry->flag == 0) { // Exact score
                     return tt_entry->score;
                 } else if (tt_entry->flag == 1) { // Lower bound
@@ -834,63 +820,93 @@ private:
             }
             tt_move = &tt_entry->best_move;
         }
-        
-        if (depth <= 0) {
+
+        if (search_depth <= 0) {
             return quiescence(alpha, beta, is_red_turn);
         }
-        
+
         vector<Move> moves = get_all_moves(is_red_turn);
         if (moves.empty()) {
+            if (in_check) {
+                return (is_red_turn == isRed) ? (-100000 + ply) : (100000 - ply);
+            }
             return evaluate_board() * (is_red_turn == isRed ? 1 : -1);
         }
-        
+
         order_moves(moves, is_red_turn, ply, tt_move);
-        
-        // Adaptive move pruning based on depth
-        int max_moves = 30;
-        if (depth >= 4) max_moves = 10;
-        else if (depth >= 3) max_moves = 15;
-        else if (depth >= 2) max_moves = 20;
-        
-        if (moves.size() > (size_t)max_moves) {
-            moves.resize(max_moves);
+
+        // Adaptive move pruning based on depth while keeping all forcing moves
+        if (!in_check) {
+            int quiet_limit = 30;
+            if (search_depth >= 4) quiet_limit = 10;
+            else if (search_depth >= 3) quiet_limit = 15;
+            else if (search_depth >= 2) quiet_limit = 20;
+
+            vector<Move> forcing_moves;
+            vector<Move> quiet_moves;
+            forcing_moves.reserve(moves.size());
+            quiet_moves.reserve(moves.size());
+
+            for (const Move& mv : moves) {
+                bool wazir_move = !mv.is_revival && toupper(board[mv.r1][mv.c1]) == 'W';
+                if (mv.is_capture || mv.is_revival || wazir_move) {
+                    forcing_moves.push_back(mv);
+                } else {
+                    quiet_moves.push_back(mv);
+                }
+            }
+
+            if (quiet_moves.size() > static_cast<size_t>(quiet_limit)) {
+                quiet_moves.resize(quiet_limit);
+            }
+
+            moves.clear();
+            moves.reserve(forcing_moves.size() + quiet_moves.size());
+            moves.insert(moves.end(), forcing_moves.begin(), forcing_moves.end());
+            moves.insert(moves.end(), quiet_moves.begin(), quiet_moves.end());
         }
-        
+
         int best_score = INT_MIN;
         Move best_move;
         int original_alpha = alpha;
-        
+
         for (size_t i = 0; i < moves.size(); i++) {
             const Move& move = moves[i];
             if (!is_valid_move(move, is_red_turn)) continue;
-            
+
             // Time check for deep searches
-            if (i > 5 && depth >= 2) {
+            if (i > 5 && search_depth >= 2) {
                 auto current_time = chrono::steady_clock::now();
                 double elapsed = chrono::duration<double>(current_time - start_time).count();
                 if (elapsed > time_limit * 0.7) break;
             }
-            
-            bool won = make_move(move);
+
+            bool won = make_move(move, is_red_turn);
             if (won) {
-                unmake_move(move);
+                unmake_move(move, is_red_turn);
                 int win_score = 100000 - ply;
-                
+
                 // Store in TT
                 TTEntry entry;
                 entry.hash = current_hash;
-                entry.depth = depth;
+                entry.depth = search_depth;
                 entry.score = win_score;
                 entry.flag = 0;
                 entry.best_move = move;
                 transposition_table[current_hash] = entry;
-                
+
                 return win_score;
             }
-            
-            int score = -negamax(depth - 1, -beta, -alpha, !is_red_turn, ply + 1);
-            unmake_move(move);
-            
+
+            bool opponent_in_check = is_in_check(!is_red_turn);
+            int next_depth = search_depth - 1;
+            if (opponent_in_check && next_depth > 0) {
+                next_depth++;
+            }
+
+            int score = -negamax(next_depth, -beta, -alpha, !is_red_turn, ply + 1);
+            unmake_move(move, is_red_turn);
+
             if (score > best_score) {
                 best_score = score;
                 best_move = move;
@@ -907,16 +923,16 @@ private:
                     }
                 }
                 if (!move.is_revival) {
-                    history[move.r1][move.c1][move.r2][move.c2] += depth * depth;
+                    history[move.r1][move.c1][move.r2][move.c2] += search_depth * search_depth;
                 }
                 break;
             }
         }
-        
+
         // Store in transposition table
         TTEntry entry;
         entry.hash = current_hash;
-        entry.depth = depth;
+        entry.depth = search_depth;
         entry.score = best_score;
         if (best_score <= original_alpha) {
             entry.flag = 2; // Upper bound
@@ -932,22 +948,19 @@ private:
     }
     
     bool has_critical_threat() {
-        // Check if our king is under immediate threat
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                char piece = board[r][c];
-                if (piece == '.') continue;
-                
-                bool is_our_king = (isRed && piece == 'W') || (!isRed && piece == 'w');
-                if (is_our_king && is_under_attack(r, c, piece)) {
-                    return true;
-                }
-            }
+        int kr, kc;
+        if (!find_king_position(isRed, kr, kc)) {
+            return true;
         }
-        return false;
+        return count_attackers_on_square(kr, kc, !isRed) > 0;
     }
     
     Move get_best_move() {
+        if (transposition_table.size() > 500000) {
+            transposition_table.clear();
+        }
+
+        refresh_hash(isRed);
         vector<Move> moves = get_all_moves(isRed);
         if (moves.empty()) {
             return Move();
@@ -955,32 +968,35 @@ private:
         
         // Check for immediate wins
         for (const Move& move : moves) {
-            bool won = make_move(move);
+            bool won = make_move(move, isRed);
             if (won) {
-                unmake_move(move);
+                unmake_move(move, isRed);
                 return move;
             }
-            unmake_move(move);
+            unmake_move(move, isRed);
         }
         
         // Iterative deepening
         Move best_move;
         int best_score = INT_MIN;
-        
+
+        bool urgent = has_critical_threat();
+
         for (int depth = 1; depth <= 20; depth++) {
             auto current_time = chrono::steady_clock::now();
             double elapsed = chrono::duration<double>(current_time - start_time).count();
-            
+
             // Stop if we're running out of time
-            if (elapsed > time_limit * 0.8) {
+            double soft_cap = urgent ? 0.9 : 0.8;
+            if (elapsed > time_limit * soft_cap) {
                 break;
             }
-            
+
             // Estimate if we have time for next depth
-            if (depth > 3 && elapsed > time_limit * 0.5) {
+            if (!urgent && depth > 3 && elapsed > time_limit * 0.5) {
                 break;
             }
-            
+
             int depth_best_score = INT_MIN;
             Move depth_best_move;
             
@@ -995,21 +1011,22 @@ private:
             bool completed_depth = false;
             for (const Move& move : moves) {
                 if (!is_valid_move(move, isRed)) continue;
-                
+
                 current_time = chrono::steady_clock::now();
                 elapsed = chrono::duration<double>(current_time - start_time).count();
-                if (elapsed > time_limit * 0.85) {
+                double hard_cap = urgent ? 0.95 : 0.85;
+                if (elapsed > time_limit * hard_cap) {
                     break;
                 }
-                
-                bool won = make_move(move);
+
+                bool won = make_move(move, isRed);
                 if (won) {
-                    unmake_move(move);
+                    unmake_move(move, isRed);
                     return move;
                 }
-                
+
                 int score = -negamax(depth - 1, INT_MIN, INT_MAX, !isRed, 1);
-                unmake_move(move);
+                unmake_move(move, isRed);
                 
                 if (score > depth_best_score) {
                     depth_best_score = score;
@@ -1159,8 +1176,8 @@ public:
             ourTurn = false;
         }
         
-        // Initialize hash after board setup
-        current_hash = compute_hash();
+        // Initialize hash after board setup (red to move at start)
+        refresh_hash(true);
         
         while (true) {
             // Check for 102-move draw rule
@@ -1234,7 +1251,7 @@ public:
                 cout << move_str << endl;
                 cout.flush();
                 
-                bool won = make_move(best_move);
+                bool won = make_move(best_move, isRed);
                 move_count++;
                 if (won) break;
                 
@@ -1250,53 +1267,22 @@ public:
                     int c1 = line[1] - '1';
                     int r2 = line[2] - 'a';
                     int c2 = line[3] - '1';
-                    
-                    char moving = board[r1][c1];
-                    char dest = board[r2][c2];
-                    
-                    // Update hash for opponent move
+
+                    char dest = in_bounds(r2, c2) ? board[r2][c2] : '.';
                     Move opp_move(r1, c1, r2, c2, dest);
-                    update_hash_for_move(opp_move);
-                    
-                    board[r2][c2] = moving;
-                    board[r1][c1] = '.';
-                    
-                    if (dest != '.') {
-                        int idx = index_of(dest);
-                        // When opponent captures our piece, THEY get it
-                        if (isRed) capBlue[idx]++;  // Opponent (Blue) captured our piece
-                        else capRed[idx]++;         // Opponent (Red) captured our piece
-                        
-                        if ((isRed && dest == 'w') || (!isRed && dest == 'W')) {
-                            break;
-                        }
-                    }
+                    bool opp_won = make_move(opp_move, !isRed);
                     move_count++;
+                    if (opp_won) break;
                 } else if (line.length() == 3) {
                     char piece = line[0];
                     int r = line[1] - 'a';
                     int c = line[2] - '1';
-                    
-                    // Update hash for opponent revival
+
                     Move opp_move(piece, r, c);
-                    update_hash_for_move(opp_move);
-                    
-                    board[r][c] = piece;
-                    int idx = index_of(piece);
-                    
-                    // Opponent is reviving their piece from their captures
-                    if ((isRed && is_lower(piece)) || (!isRed && is_upper(piece))) {
-                        // Opponent (Blue if we're Red, Red if we're Blue) revives their piece
-                        if (isRed) capBlue[idx]--;  // Blue uses their capture
-                        else capRed[idx]--;         // Red uses their capture
-                    } else {
-                        // Shouldn't happen - opponent reviving our piece?
-                        if (isRed) capRed[idx]--;
-                        else capBlue[idx]--;
-                    }
+                    make_move(opp_move, !isRed);
                     move_count++;
                 }
-                
+
                 ourTurn = true;
             }
         }
