@@ -1,0 +1,2 @@
+# codingcup
+Code for challenge
